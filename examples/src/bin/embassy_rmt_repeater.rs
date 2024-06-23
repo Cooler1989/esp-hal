@@ -26,27 +26,96 @@ use esp_hal::{
 use esp_println::{print, println};
 
 const WIDTH: usize = 80;
+const RMT_CLK_DIV: u8 = 128;
 
 static RECEIVED_COUNT: Mutex<RefCell<Option<u32>>> =
     Mutex::new(RefCell::new(None));
+
+static RECEIVED_DATA : critical_section::Mutex<RefCell<Option<[PulseCode; 48]>>> =
+    Mutex::new(RefCell::new(
+        Some([PulseCode {
+                level1: true,
+                length1: 0,
+                level2: false,
+                length2: 0,
+            }; 48]) ));
 
 #[cfg(debug_assertions)]
 compile_error!("Run this example in release mode");
 
 #[embassy_executor::task]
-async fn signal_task(channel: esp_hal::rmt::Channel<Async, 1>, mut button: AnyInput<'static>) {
+async fn signal_task(mut channel: esp_hal::rmt::Channel<Async, 1>, mut button: AnyInput<'static>) {
     let mut level = false;
     loop {
         let new_level = button.is_high();
         if level != new_level {
             level = new_level;
-            let count = critical_section::with(|cs| {
-                let mut count = RECEIVED_COUNT.borrow_ref(cs);
-                //  *count
-                (*count).unwrap_or(0)
+            let (count, data) = critical_section::with(|cs| {
+                let count = RECEIVED_COUNT.borrow_ref(cs);
+                let data = RECEIVED_DATA.borrow_ref(cs);
+                let ret_data = match *data {
+                    Some(data) => {
+                        let mut ret_data = [PulseCode {
+                            level1: true,
+                            length1: 0,
+                            level2: false,
+                            length2: 0,
+                        }; 48];
+
+                        for (i, entry) in data[..data.len()].iter().enumerate() {
+                            ret_data[i] = *entry;
+                        }
+                        Some(ret_data)
+                    },
+                    None => {None}
+                };
+
+                let count = (*count).unwrap_or(0);
+                (count, ret_data)
             });
+
             println!("button {new_level}, count: {count}");
-            Timer::after(Duration::from_millis(100)).await;
+            if let Some(data) = data {
+                let mut total = 0usize;
+                for entry in &data[..data.len()] {
+                    if entry.length1 == 0 {
+                        break;
+                    }
+                    total += entry.length1 as usize;
+
+                    if entry.length2 == 0 {
+                        break;
+                    }
+                    total += entry.length2 as usize;
+                }
+                println!("data size {}, total: {}", data.len(), total);
+                for entry in &data[..data.len()] {
+                    if entry.length1 == 0 {
+                        break;
+                    }
+
+                    let count = WIDTH / (total / entry.length1 as usize);
+                    let c = if entry.level1 { '-' } else { '_' };
+                    for _ in 0..count + 1 {
+                        print!("{}", c);
+                    }
+
+                    if entry.length2 == 0 {
+                        break;
+                    }
+
+                    let count = WIDTH / (total / entry.length2 as usize);
+                    let c = if entry.level2 { '-' } else { '_' };
+                    for _ in 0..count + 1 {
+                        print!("{}", c);
+                    }
+                }
+                println!();
+
+                //  Send it to the ether:
+                channel.transmit(&data).await.unwrap();
+            }
+            Timer::after(Duration::from_millis(1000)).await;
         }
         Timer::after(Duration::from_millis(100)).await;
     }
@@ -78,17 +147,20 @@ async fn main(spawner: Spawner) {
     }
 
     let mut button = AnyInput::new(io.pins.gpio0, Pull::Up);
+    let mut led = Output::new(io.pins.gpio2, Level::High);
 
     let rmt = Rmt::new_async(peripherals.RMT, freq, &clocks).unwrap();
     let rx_config = RxChannelConfig {
-        clk_divider: 255,
+        clk_divider: RMT_CLK_DIV,
         idle_threshold: 10000,
         ..RxChannelConfig::default()
     };
 
     let mut channel_tx =
         TxChannelCreatorAsync::configure(rmt.channel1, io.pins.gpio27, TxChannelConfig{
-            clk_divider: 255,
+            clk_divider: RMT_CLK_DIV,
+            idle_output_level: false,
+            idle_output: false,
             ..TxChannelConfig::default()
         }).unwrap();
 
@@ -113,6 +185,12 @@ async fn main(spawner: Spawner) {
         length2: 1,
     }; 48];
 
+    //  channel.transmit(&data).await.unwrap();
+
+    for i in &data {
+        led.toggle();
+        Timer::after(Duration::from_millis(100)).await;
+    }
     loop {
         println!("receive");
         channel.receive(&mut data).await.unwrap();
@@ -141,8 +219,28 @@ async fn main(spawner: Spawner) {
 
         critical_section::with(|cs| {
             let mut count = RECEIVED_COUNT.borrow_ref_mut(cs);
+            if let Some(_) = *count {
+                return;
+            }
             *count = Some(length as u32);
+            let mut cs_data = RECEIVED_DATA.borrow_ref_mut(cs);
+            *cs_data = Some(data);
+
+            //  match *cs_data {
+            //      Some(mut array) => {
+            //          let mut iter = data[..data.len()].iter().enumerate();
+            //          for (i, entry) in data[..data.len()].iter().enumerate() {
+            //              array[i] = *entry;
+            //          }
+            //      },
+            //      None => {}
+            //  }
         });
+        //  just a led toggle:
+        for i in &data[..length] {
+            led.toggle();
+            Timer::after(Duration::from_millis(100)).await;
+        }
 
 
         for entry in &data[..data.len()] {

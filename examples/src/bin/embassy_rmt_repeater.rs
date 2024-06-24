@@ -50,21 +50,28 @@ async fn signal_task(mut channel: esp_hal::rmt::Channel<Async, 1>, mut button: A
         let new_level = button.is_high();
         if level != new_level {
             level = new_level;
+            if new_level == true {
+                Timer::after(Duration::from_millis(500)).await;
+                continue;
+            }
             let (count, data) = critical_section::with(|cs| {
                 let count = RECEIVED_COUNT.borrow_ref(cs);
+                if *count == None {
+                    return (0, None);
+                }
                 let data = RECEIVED_DATA.borrow_ref(cs);
                 let ret_data = match *data {
                     Some(data) => {
-                        let mut ret_data = [PulseCode {
-                            level1: true,
-                            length1: 0,
-                            level2: false,
-                            length2: 0,
-                        }; 48];
+                        println!("borrow_ref Some(data)");
+                        let mut ret_data = [PulseCode::default(); 48];
 
                         for (i, entry) in data[..data.len()].iter().enumerate() {
-                            ret_data[i] = *entry;
+                            ret_data[i].level1 = !(*entry).level1;
+                            ret_data[i].length1 = (*entry).length1;
+                            ret_data[i].level2 = !(*entry).level2;
+                            ret_data[i].length2 = (*entry).length2;
                         }
+                        ret_data[((*count).unwrap_or(0u32)) as usize] = PulseCode::default();
                         Some(ret_data)
                     },
                     None => {None}
@@ -76,8 +83,13 @@ async fn signal_task(mut channel: esp_hal::rmt::Channel<Async, 1>, mut button: A
 
             println!("button {new_level}, count: {count}");
             if let Some(data) = data {
+                //  Send it to the ether:
+                channel.transmit(&data).await.unwrap();
                 let mut total = 0usize;
+                let mut i = 0;
                 for entry in &data[..data.len()] {
+                    println!("[{i}]: e.l1 = {}, e.l2 ={}", entry.length1, entry.length2);
+                    i+=1;
                     if entry.length1 == 0 {
                         break;
                     }
@@ -112,8 +124,10 @@ async fn signal_task(mut channel: esp_hal::rmt::Channel<Async, 1>, mut button: A
                 }
                 println!();
 
-                //  Send it to the ether:
-                channel.transmit(&data).await.unwrap();
+            }
+            else
+            {
+                println!("Missing data");
             }
             Timer::after(Duration::from_millis(1000)).await;
         }
@@ -156,13 +170,35 @@ async fn main(spawner: Spawner) {
         ..RxChannelConfig::default()
     };
 
+    let mut data = [PulseCode {
+        level1: true,
+        length1: 100,
+        level2: false,
+        length2: 20,
+    }; 48];
+    data[data.len() - 1] = PulseCode::default();
+
     let mut channel_tx =
-        TxChannelCreatorAsync::configure(rmt.channel1, io.pins.gpio27, TxChannelConfig{
-            clk_divider: RMT_CLK_DIV,
-            idle_output_level: false,
-            idle_output: false,
-            ..TxChannelConfig::default()
+        TxChannelCreatorAsync::configure(rmt.channel1, io.pins.gpio27,
+            TxChannelConfig{
+                clk_divider: RMT_CLK_DIV,
+                idle_output_level: false,
+                idle_output: false,
+                carrier_modulation: true,
+                //  carrier_high: 0u16,
+                //  carrier_low: 0u16,
+                carrier_high: 1050u16,
+                carrier_low: 1050u16,
+                carrier_level: true,
         }).unwrap();
+
+    for (i, entry) in data[..data.len()].iter().enumerate() {
+        println!("[{i}],e={},l={}, e2={},l2={}", entry.level1, entry.length1, entry.level2, entry.length2);
+    }
+
+    println!("transmit");
+    channel_tx.transmit(&data).await.unwrap();
+    Timer::after(Duration::from_millis(500)).await;
 
     cfg_if::cfg_if! {
         if #[cfg(any(feature = "esp32", feature = "esp32s2"))] {
@@ -178,16 +214,9 @@ async fn main(spawner: Spawner) {
         .spawn(signal_task(channel_tx, button))
         .unwrap();
 
-    let mut data = [PulseCode {
-        level1: true,
-        length1: 1,
-        level2: false,
-        length2: 1,
-    }; 48];
-
     //  channel.transmit(&data).await.unwrap();
 
-    for i in &data {
+    for i in 1..7 {
         led.toggle();
         Timer::after(Duration::from_millis(100)).await;
     }
@@ -217,6 +246,16 @@ async fn main(spawner: Spawner) {
 
         };
 
+        let mut ret_data = [PulseCode::default(); 48];
+        for (i, entry) in data[..data.len()].iter().enumerate() {
+            ret_data[i] = *entry;
+        }
+
+        for (i, entry) in ret_data[..data.len()].iter().enumerate() {
+            println!("a[{i}]={:?}", *entry);
+            if i == length { break; }
+        }
+
         critical_section::with(|cs| {
             let mut count = RECEIVED_COUNT.borrow_ref_mut(cs);
             if let Some(_) = *count {
@@ -224,17 +263,8 @@ async fn main(spawner: Spawner) {
             }
             *count = Some(length as u32);
             let mut cs_data = RECEIVED_DATA.borrow_ref_mut(cs);
-            *cs_data = Some(data);
 
-            //  match *cs_data {
-            //      Some(mut array) => {
-            //          let mut iter = data[..data.len()].iter().enumerate();
-            //          for (i, entry) in data[..data.len()].iter().enumerate() {
-            //              array[i] = *entry;
-            //          }
-            //      },
-            //      None => {}
-            //  }
+            *cs_data = Some(ret_data);
         });
         //  just a led toggle:
         for i in &data[..length] {
@@ -267,12 +297,20 @@ async fn main(spawner: Spawner) {
 
         println!();
         println!("loop closing");
+        if length > 10 {
+            println!("Start loop");
+            loop {
+                //  input.wait_for_falling_edge().await;
+                println!("loop");
+                Timer::after(Duration::from_millis(1000)).await;
+            }
+        }
     }
 
-    //  println!("Start loop");
-    //  loop {
-    //      input.wait_for_falling_edge().await;
-    //      println!("loop");
-    //      Timer::after(Duration::from_millis(1000)).await;
-    //  }
+    println!("Start loop");
+    loop {
+        //  input.wait_for_falling_edge().await;
+        println!("loop");
+        Timer::after(Duration::from_millis(1000)).await;
+    }
 }

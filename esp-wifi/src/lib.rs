@@ -49,6 +49,7 @@ pub mod ble;
 pub mod esp_now;
 
 pub(crate) mod common_adapter;
+pub use common_adapter::random;
 
 #[doc(hidden)]
 pub mod tasks;

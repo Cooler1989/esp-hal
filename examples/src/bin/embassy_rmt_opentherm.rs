@@ -17,7 +17,7 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::{
     clock::ClockControl,
-    gpio::{Input, Pull, Io, Level, Output, AnyInput},
+    gpio::{GpioPin, OutputPin, Input, Pull, Io, Level, Output, AnyInput, AnyOutput},
     peripherals::Peripherals,
     prelude::*,
     rng::Rng,
@@ -495,6 +495,10 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
+    let mut rng = RngDummy::new();
+    log::info!("rng.next_u32() = {:x}", rng.next_u32());
+    log::info!("rng.next_u32() = {:x}", rng.next_u32());
+
     let wifi = peripherals.WIFI;
     let (wifi_interface, controller) =
         esp_wifi::wifi::new_with_mode(&init, wifi, WifiStaDevice).unwrap();
@@ -512,22 +516,29 @@ async fn main(spawner: Spawner) {
         esp_hal_embassy::init(&clocks, systimer.alarm0);
     }
 
-    let mut rng = RngDummy::new();
-    log::info!("rng.next_u32() = {:x}", rng.next_u32());
-    log::info!("rng.next_u32() = {:x}", rng.next_u32());
-
     let config = Config::dhcpv4(Default::default());
 
     let mut button = AnyInput::new(io.pins.gpio0, Pull::Up);
     let mut led = Output::new(io.pins.gpio2, Level::High);
 
     let rmt = Rmt::new_async(peripherals.RMT, freq, &clocks).unwrap();
-    let rx_config = RxChannelConfig {
-        clk_divider: RMT_CLK_DIV,
-        idle_threshold: 10000,
-        ..RxChannelConfig::default()
-    };
 
+    //  Mqtt
+    let seed = rng.next_u64(); // very random, very secure seed
+
+    // Init network stack
+    let stack = &*mk_static!(
+        Stack<WifiDevice<'_, WifiStaDevice>>,
+        Stack::new(
+            wifi_interface,
+            config,
+            mk_static!(StackResources<3>, StackResources::<3>::new()),
+            seed
+        )
+    );
+
+    ///  TODO: Create boiler factory function:
+    ///
     let mut channel_tx =
         TxChannelCreatorAsync::configure(rmt.channel1, io.pins.gpio27,
             TxChannelConfig{
@@ -542,6 +553,11 @@ async fn main(spawner: Spawner) {
                 carrier_level: true,
         }).unwrap();
 
+    let rx_config = RxChannelConfig {
+        clk_divider: RMT_CLK_DIV,
+        idle_threshold: 10000,
+        ..RxChannelConfig::default()
+    };
     cfg_if::cfg_if! {
         if #[cfg(any(feature = "esp32", feature = "esp32s2"))] {
             let mut channel_rx = RxChannelCreatorAsync::configure(rmt.channel0, io.pins.gpio4, rx_config).unwrap();
@@ -563,25 +579,10 @@ async fn main(spawner: Spawner) {
 
     let mut boiler = BoilerControl::new(opentherm_device, esp_time);
 
-    //  Mqtt
-    let seed = rng.next_u64(); // very random, very secure seed
-
-    // Init network stack
-    let stack = &*mk_static!(
-        Stack<WifiDevice<'_, WifiStaDevice>>,
-        Stack::new(
-            wifi_interface,
-            config,
-            mk_static!(StackResources<3>, StackResources::<3>::new()),
-            seed
-        )
-    );
-
     spawner.spawn(connection(controller)).ok();
     spawner.spawn(net_task(&stack)).ok();
     spawner.spawn(mqtt_task(&stack)).ok();
     spawner.spawn(boiler_task(boiler)).ok();
-
 
     println!("Start loop");
     loop {
